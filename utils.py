@@ -33,12 +33,14 @@ TB_APP = "com.taobao.taobao"
 ALIPAY_APP = "com.eg.android.AlipayGphone"
 FISH_APP = "com.taobao.idlefish"
 TMALL_APP = "com.tmall.wireless"
+ZEEHO_APP = "com.cfmoto"
 
 # 应用启动配置，键为包名，值为activity
 APP_START_CONFIG = {
     TB_APP: "com.taobao.tao.welcome.Welcome",
     FISH_APP: "com.taobao.fleamarket.home.activity.InitActivity",
     TMALL_APP: "com.tmall.wireless.maintab.module.TMMainTabActivity",
+    ZEEHO_APP: "com.cfmoto.ui.MainActivity",
     ALIPAY_APP: None  # 默认配置，不指定activity
 }
 
@@ -197,10 +199,12 @@ def check_can_open(d):
 #     return full_sentence
 
 
-easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)  # ch_sim: 简体中文
-
+easyocr_reader = None
 
 def easy_ocr(image):
+    global easyocr_reader
+    if easyocr_reader is None:
+        easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)  # ch_sim: 简体中文
     if isinstance(image, Image.Image):
         image = np.array(image)
     result = easyocr_reader.readtext(image)
@@ -208,9 +212,12 @@ def easy_ocr(image):
     return text
 
 
-import torch
-print("PyTorch 版本:", torch.version)
-print("CUDA 是否可用:", torch.cuda.is_available())
+try:
+    import torch
+    print("PyTorch 版本:", torch.__version__)
+    print("CUDA 是否可用:", torch.cuda.is_available())
+except ImportError:
+    pass
 
 
 # 判断一个字符是否为中文字符
