@@ -1,30 +1,12 @@
-# coin11-tb
-使用uiautomator2自动化完成淘宝双11的金币任务，淘金币任务，芭芭农场任务，闲鱼任务，支付宝打卡任务。
+# Zeeho & Taobao Automation Task
 
-需要安装adb，自行百度教程。
-使用教程请看抖音
-```
-3.53 04/14 X@z.TY bnD:/ 自动化完成淘宝任务教程  https://v.douyin.com/i5xNsWVx/ 复制此链接，打开Dou音搜索，直接观看视频！
-```
-或者快手
-```
-https://v.kuaishou.com/nGmUFX 自动化完成淘宝任务教程 该作品在快手被播放过1次，点击链接，打开【快手极速版】直接观看！
-```
+本项目基于 `uiautomator2` 自动化完成淘宝金币任务及极核 (Zeeho) 每日签到/点赞任务。
 
-* 使用uiauto.dev查看ui组件
-```
-pip3 install uiautodev
-# 启动
-uiauto.dev
-```
+*   `taobao_coins_task.py`: 淘金币任务脚本。
+*   `zeeho_task.py`: 极核 (Zeeho) APP 签到及点赞任务。
+*   `utils.py`: 核心工具库。
 
-adb命令，获取当前打开的app包名和类名
-```shell
-adb shell dumpsys window | grep mCurrentFocus
-adb shell dumpsys window | findstr mCurrentFocus
-```
-
-目前淘宝芭芭农场和淘金币任务相对完善，其他的还有问题。
+目前系统已针对 MacOS + Android 环境进行了深度优化（包括依赖包兼容性和 OCR 懒加载）。
 $\color{red}{目前的问题是，uiautomator2将列表上滑一页后，获取的数据还是上一页的，这个问题已反馈作者但未解决。}$
 
 ```shell
