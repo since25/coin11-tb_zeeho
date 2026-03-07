@@ -34,6 +34,7 @@ ALIPAY_APP = "com.eg.android.AlipayGphone"
 FISH_APP = "com.taobao.idlefish"
 TMALL_APP = "com.tmall.wireless"
 ZEEHO_APP = "com.cfmoto"
+QD_APP = "com.qidian.QDReader"
 
 # 应用启动配置，键为包名，值为activity
 APP_START_CONFIG = {
@@ -41,6 +42,7 @@ APP_START_CONFIG = {
     FISH_APP: "com.taobao.fleamarket.home.activity.InitActivity",
     TMALL_APP: "com.tmall.wireless.maintab.module.TMMainTabActivity",
     ZEEHO_APP: "com.cfmoto.ui.MainActivity",
+    QD_APP: "com.qidian.QDReader.ui.activity.MainGroupActivity",
     ALIPAY_APP: None  # 默认配置，不指定activity
 }
 
@@ -201,13 +203,15 @@ def check_can_open(d):
 
 easyocr_reader = None
 
-def easy_ocr(image):
+def easy_ocr(image, return_info=False):
     global easyocr_reader
     if easyocr_reader is None:
         easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)  # ch_sim: 简体中文
     if isinstance(image, Image.Image):
         image = np.array(image)
     result = easyocr_reader.readtext(image)
+    if return_info:
+        return result
     text = ' '.join([res[1] for res in result])  # 直接拼接文字
     return text
 

@@ -4,6 +4,7 @@
 
 *   `taobao_coins_task.py`: 淘金币任务脚本。
 *   `zeeho_task.py`: 极核 (Zeeho) APP 签到及点赞任务。
+*   `qidian_task.py`: 起点读书 APP 福利中心任务（签到、视频）。
 *   `utils.py`: 核心工具库。
 
 目前系统已针对 MacOS + Android 环境进行了深度优化（包括依赖包兼容性和 OCR 懒加载）。
