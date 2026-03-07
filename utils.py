@@ -8,6 +8,8 @@ import ddddocr
 import subprocess
 import ssl
 import urllib.request
+import platform
+import os
 
 # 正确的SSL禁用方式：赋值为「调用后的上下文对象」，而非函数本身
 original_context = ssl._create_default_https_context
@@ -21,7 +23,16 @@ urllib.request.install_opener(opener)
 
 # from paddleocr import PaddleOCR
 from PIL import Image
-import easyocr
+
+try:
+    import easyocr
+except Exception:
+    easyocr = None
+
+try:
+    from ocrmac.ocrmac import OCR as MacOCR
+except Exception:
+    MacOCR = None
 
 
 # 关闭 ppocr 的所有日志（推荐）
@@ -202,14 +213,90 @@ def check_can_open(d):
 
 
 easyocr_reader = None
+_ocr_backend_logged = False
+
+def _normalize_ocrmac_result(result, image_size=None):
+    """
+    ocrmac 返回 [(text, conf, (x, y, w, h)), ...]
+    统一转换成 easyocr 风格 [(bbox, text, conf), ...]
+    """
+    normalized = []
+    max_w, max_h = None, None
+    if image_size and len(image_size) == 2:
+        max_w, max_h = image_size
+
+    for item in result or []:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            continue
+        text, conf, box = item
+        if not text or box is None or len(box) != 4:
+            continue
+
+        # ocrmac 返回的是 (x1, y1, x2, y2)，不是 (x, y, w, h)
+        x1, y1, x2, y2 = [float(v) for v in box]
+        left = min(x1, x2)
+        top = min(y1, y2)
+        right = max(x1, x2)
+        bottom = max(y1, y2)
+
+        # 裁剪到图像范围内，防止异常值导致越界点击
+        if max_w is not None and max_h is not None:
+            left = max(0.0, min(left, float(max_w - 1)))
+            top = max(0.0, min(top, float(max_h - 1)))
+            right = max(0.0, min(right, float(max_w - 1)))
+            bottom = max(0.0, min(bottom, float(max_h - 1)))
+        if right <= left or bottom <= top:
+            continue
+
+        bbox = [
+            [left, top],
+            [right, top],
+            [right, bottom],
+            [left, bottom],
+        ]
+        normalized.append((bbox, str(text), float(conf)))
+    return normalized
 
 def easy_ocr(image, return_info=False):
-    global easyocr_reader
-    if easyocr_reader is None:
-        easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)  # ch_sim: 简体中文
-    if isinstance(image, Image.Image):
-        image = np.array(image)
-    result = easyocr_reader.readtext(image)
+    global easyocr_reader, _ocr_backend_logged
+
+    result = []
+    backend_pref = os.getenv("OCR_BACKEND", "auto").lower()
+    use_ocrmac = (platform.system() == "Darwin" and MacOCR is not None and backend_pref in ("auto", "ocrmac"))
+
+    # 优先使用 macOS Vision（Apple Silicon/Intel Mac 都可用）
+    if use_ocrmac:
+        try:
+            pil_img = image if isinstance(image, Image.Image) else Image.fromarray(np.array(image))
+            mac_res = MacOCR(
+                pil_img,
+                recognition_level="accurate",
+                detail=True,
+                language_preference=["zh-Hans", "en-US"],
+            ).recognize(px=True)
+            result = _normalize_ocrmac_result(mac_res, image_size=pil_img.size)
+            if result and not _ocr_backend_logged:
+                print("OCR 后端: ocrmac (Apple Vision)")
+                _ocr_backend_logged = True
+        except Exception as e:
+            print(f"ocrmac 识别失败，回退 easyocr: {e}")
+
+    # 回退 easyocr（跨平台兜底）
+    allow_fallback = (backend_pref != "ocrmac")
+    if (not result) and allow_fallback:
+        if easyocr is None:
+            if return_info:
+                return []
+            return ""
+        if easyocr_reader is None:
+            easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)  # fallback
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        result = easyocr_reader.readtext(image)
+        if not _ocr_backend_logged:
+            print("OCR 后端: easyocr (fallback)")
+            _ocr_backend_logged = True
+
     if return_info:
         return result
     text = ' '.join([res[1] for res in result])  # 直接拼接文字
