@@ -214,6 +214,7 @@ def check_can_open(d):
 
 easyocr_reader = None
 _ocr_backend_logged = False
+_easyocr_device_logged = False
 
 def _normalize_ocrmac_result(result, image_size=None):
     """
@@ -258,7 +259,7 @@ def _normalize_ocrmac_result(result, image_size=None):
     return normalized
 
 def easy_ocr(image, return_info=False):
-    global easyocr_reader, _ocr_backend_logged
+    global easyocr_reader, _ocr_backend_logged, _easyocr_device_logged
 
     result = []
     backend_pref = os.getenv("OCR_BACKEND", "auto").lower()
@@ -289,7 +290,30 @@ def easy_ocr(image, return_info=False):
                 return []
             return ""
         if easyocr_reader is None:
-            easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)  # fallback
+            gpu_preferred = False
+            if platform.system() == "Darwin":
+                try:
+                    import torch
+                    gpu_preferred = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+                except Exception:
+                    gpu_preferred = False
+            if gpu_preferred:
+                try:
+                    easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
+                    if not _easyocr_device_logged:
+                        print("easyocr 设备: Apple MPS/GPU")
+                        _easyocr_device_logged = True
+                except Exception as e:
+                    print(f"easyocr GPU 初始化失败，回退 CPU: {e}")
+                    easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)
+                    if not _easyocr_device_logged:
+                        print("easyocr 设备: CPU")
+                        _easyocr_device_logged = True
+            else:
+                easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)
+                if not _easyocr_device_logged:
+                    print("easyocr 设备: CPU")
+                    _easyocr_device_logged = True
         if isinstance(image, Image.Image):
             image = np.array(image)
         result = easyocr_reader.readtext(image)
