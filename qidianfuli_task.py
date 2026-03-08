@@ -116,6 +116,69 @@ def find_task_row_and_action(items, spec, anchor_y=None):
     return row, action
 
 
+def enter_welfare_center_selector_first(d, max_rounds=6):
+    """
+    从起点主界面进入福利中心：selector/xpath 优先，OCR 仅兜底。
+    该函数对 OCR 质量依赖更低，适合 Linux + pytesseract 场景。
+    """
+    # 1) 先确保进入“我/我的”页
+    me_candidates = [
+        d(resourceIdMatches=r".*tab_me.*|.*f6.*", text="我的"),
+        d(resourceId="com.qidian.QDReader:id/view_tab_title_title", text="我"),
+        d(text="我"),
+        d(text="我的"),
+    ]
+    clicked_me = False
+    for sel in me_candidates:
+        try:
+            if sel.exists:
+                sel.click()
+                clicked_me = True
+                break
+        except Exception:
+            pass
+    if not clicked_me:
+        items = ocr_items(d)
+        if click_text_candidate(d, items, ["我的", "我"], region="all"):
+            clicked_me = True
+    if not clicked_me:
+        # 极端兜底：底部右侧“我”标签附近
+        w, h = d.window_size()
+        d.click(int(w * 0.90), int(h * 0.965))
+    time.sleep(1.8)
+
+    # 2) 在“我”页找“福利中心”
+    for i in range(max_rounds):
+        benefit_parent = d.xpath('//*[@text="福利中心"]/..')
+        benefit_grand = d.xpath('//*[@text="福利中心"]/../..')
+        benefit_btn = d(text="福利中心")
+
+        if benefit_parent.exists:
+            benefit_parent.click()
+            time.sleep(2.5)
+            return True
+        if benefit_grand.exists:
+            benefit_grand.click()
+            time.sleep(2.5)
+            return True
+        if benefit_btn.exists:
+            benefit_btn.click()
+            time.sleep(2.5)
+            return True
+
+        # OCR 兜底
+        items = ocr_items(d)
+        if click_text_candidate(d, items, ["福利中心"], region="all"):
+            time.sleep(2.5)
+            return True
+
+        d.swipe_ext("up", scale=0.20)
+        time.sleep(1.0)
+        print(f"查找福利中心中... {i + 1}/{max_rounds}")
+
+    return False
+
+
 def scroll_to_task_panel(d, max_rounds=8):
     for idx in range(max_rounds):
         items = ocr_items(d)
@@ -333,18 +396,7 @@ def recover_to_welfare_page(d, max_rounds=10):
         rewardvideo_streak = 0
         if "MainGroupActivity" in activity:
             print("[recover] 已退回主界面，尝试重新进入福利中心")
-            # 先尝试进入“我”标签
-            if not (d(text="我").click_exists(timeout=0.5) or d(text="我的").click_exists(timeout=0.5)):
-                click_text_candidate(d, items, ["我", "我的"], region="all")
-            time.sleep(1.2)
-            # 再尝试点击“福利中心”
-            for _ in range(3):
-                nitems = ocr_items(d)
-                if click_text_candidate(d, nitems, ["福利中心"], region="all"):
-                    time.sleep(2.2)
-                    break
-                d.swipe_ext("up", scale=0.2)
-                time.sleep(1.0)
+            enter_welfare_center_selector_first(d, max_rounds=4)
             continue
         if pkg != QD_APP:
             print("[recover] 当前在外部应用，执行 back")
@@ -567,21 +619,7 @@ def bootstrap_to_welfare_center(d, max_rounds=8):
             return True
 
         if "MainGroupActivity" in activity:
-            # 进入“我”
-            if not (d(text="我").click_exists(timeout=0.6) or d(text="我的").click_exists(timeout=0.6)):
-                click_text_candidate(d, items, ["我", "我的"], region="all")
-            time.sleep(1.2)
-            # 点击“福利中心”
-            hit = False
-            for _ in range(4):
-                nitems = ocr_items(d)
-                if click_text_candidate(d, nitems, ["福利中心"], region="all"):
-                    time.sleep(2.2)
-                    hit = True
-                    break
-                d.swipe_ext("up", scale=0.2)
-                time.sleep(1.0)
-            if hit:
+            if enter_welfare_center_selector_first(d, max_rounds=4):
                 continue
 
         # 其他页面用回退恢复
