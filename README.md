@@ -110,3 +110,30 @@ adb shell uiautomator dump /sdcard/window_dump.xml
 adb pull /sdcard/window_dump.xml .
 adb shell rm /sdcard/window_dump.xml
 ```
+
+## 7. Ubuntu 常见问题
+
+### 7.1 `pytesseract is not installed or it's not in your PATH`
+
+该报错表示系统缺少 `tesseract` 可执行文件（仅安装 Python 包 `pytesseract` 不够）。
+
+执行以下命令安装：
+
+```bash
+sudo apt update
+sudo apt install -y tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng
+```
+
+安装后检查：
+
+```bash
+which tesseract
+tesseract --list-langs | grep -E 'chi_sim|eng'
+```
+
+推荐在 Ubuntu 上显式指定 OCR 后端运行：
+
+```bash
+. .venv/bin/activate
+OCR_BACKEND=pytesseract PYTHONUNBUFFERED=1 python -u qidianfuli_task.py
+```
