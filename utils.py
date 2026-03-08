@@ -30,6 +30,11 @@ except Exception:
     easyocr = None
 
 try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
     from ocrmac.ocrmac import OCR as MacOCR
 except Exception:
     MacOCR = None
@@ -258,6 +263,61 @@ def _normalize_ocrmac_result(result, image_size=None):
         normalized.append((bbox, str(text), float(conf)))
     return normalized
 
+def _normalize_pytesseract_result(tsv_data, image_size=None):
+    """
+    pytesseract image_to_data 结果转成 easyocr 风格:
+    [(bbox, text, conf), ...]
+    """
+    normalized = []
+    if not tsv_data:
+        return normalized
+    max_w, max_h = None, None
+    if image_size and len(image_size) == 2:
+        max_w, max_h = image_size
+
+    keys = ("text", "conf", "left", "top", "width", "height")
+    if not all(k in tsv_data for k in keys):
+        return normalized
+
+    n = len(tsv_data["text"])
+    for i in range(n):
+        text = (tsv_data["text"][i] or "").strip()
+        if not text:
+            continue
+        try:
+            conf = float(tsv_data["conf"][i])
+        except Exception:
+            conf = -1.0
+        if conf < 0:
+            continue
+        try:
+            left = float(tsv_data["left"][i])
+            top = float(tsv_data["top"][i])
+            width = float(tsv_data["width"][i])
+            height = float(tsv_data["height"][i])
+        except Exception:
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        right = left + width
+        bottom = top + height
+        if max_w is not None and max_h is not None:
+            left = max(0.0, min(left, float(max_w - 1)))
+            top = max(0.0, min(top, float(max_h - 1)))
+            right = max(0.0, min(right, float(max_w - 1)))
+            bottom = max(0.0, min(bottom, float(max_h - 1)))
+        if right <= left or bottom <= top:
+            continue
+
+        bbox = [
+            [left, top],
+            [right, top],
+            [right, bottom],
+            [left, bottom],
+        ]
+        normalized.append((bbox, str(text), conf / 100.0))
+    return normalized
+
 def easy_ocr(image, return_info=False):
     global easyocr_reader, _ocr_backend_logged, _easyocr_device_logged
 
@@ -282,9 +342,33 @@ def easy_ocr(image, return_info=False):
         except Exception as e:
             print(f"ocrmac 识别失败，回退 easyocr: {e}")
 
-    # 回退 easyocr（跨平台兜底）
-    allow_fallback = (backend_pref != "ocrmac")
-    if (not result) and allow_fallback:
+    # Linux/Windows 默认优先 pytesseract，规避部分 CPU 对 torch 指令集不兼容导致的 SIGILL
+    use_tesseract = backend_pref in ("auto", "pytesseract", "tesseract")
+    if (not result) and use_tesseract and pytesseract is not None:
+        try:
+            pil_img = image if isinstance(image, Image.Image) else Image.fromarray(np.array(image))
+            tsv_data = pytesseract.image_to_data(
+                pil_img,
+                lang="chi_sim+eng",
+                output_type=pytesseract.Output.DICT,
+                config="--psm 6",
+            )
+            result = _normalize_pytesseract_result(tsv_data, image_size=pil_img.size)
+            if result and not _ocr_backend_logged:
+                print("OCR 后端: pytesseract")
+                _ocr_backend_logged = True
+        except Exception as e:
+            print(f"pytesseract 识别失败: {e}")
+
+    # easyocr 仅在 macOS auto（ocrmac 失败后的兜底）或显式指定 OCR_BACKEND=easyocr 时启用
+    allow_easyocr = (
+        easyocr is not None
+        and (
+            backend_pref == "easyocr"
+            or (backend_pref == "auto" and platform.system() == "Darwin")
+        )
+    )
+    if (not result) and allow_easyocr:
         if easyocr is None:
             if return_info:
                 return []
