@@ -369,7 +369,6 @@ def task_loop(d, back_func, origin_app=TB_APP, is_fish=False, duration=22):
                     search_btn.click()
                     time.sleep(2)
     screen_width, screen_height = d.window_size()
-    package_name, _ = get_current_app(d)
     # check_count = 3
     # while check_count >= 0:
     #     if not func():
@@ -383,6 +382,7 @@ def task_loop(d, back_func, origin_app=TB_APP, is_fish=False, duration=22):
     print("开始做任务。。。")
     while True:
         try:
+            package_name, _ = get_current_app(d)
             bt_open = d(resourceId="android:id/button1", text="浏览器打开")
             if bt_open.exists:
                 bt_close = d(resourceId="android:id/button2", text="取消")
@@ -407,14 +407,14 @@ def task_loop(d, back_func, origin_app=TB_APP, is_fish=False, duration=22):
                     d.click(300, commodity_view2.center()[1])
                     time.sleep(18)
                     break
-            if package_name == origin_app or package_name == TMALL_APP:
-                if package_name == ALIPAY_APP:
-                    screen_image = d.screenshot(format='opencv')
-                    pt1 = find_button(screen_image, "./img/alipay_get.png")
-                    if pt1:
-                        print("检测到立即领取的弹框，点击立即领取")
-                        d.click(int(pt1[0]) + 50, int(pt1[1]) + 20)
-                        time.sleep(1)
+            if package_name == ALIPAY_APP:
+                screen_image = d.screenshot(format='opencv')
+                pt1 = find_button(screen_image, "./img/alipay_get.png")
+                if pt1:
+                    print("检测到立即领取的弹框，点击立即领取")
+                    d.click(int(pt1[0]) + 50, int(pt1[1]) + 20)
+                    time.sleep(1)
+            if package_name in (origin_app, TMALL_APP, ALIPAY_APP):
                 start_x = random.randint(screen_width // 6, screen_width // 2)
                 start_y = random.randint(screen_height // 2, screen_height - screen_width // 4)
                 end_x = random.randint(start_x - 100, start_x)
@@ -424,9 +424,11 @@ def task_loop(d, back_func, origin_app=TB_APP, is_fish=False, duration=22):
                 d.swipe(start_x, start_y, end_x, end_y, swipe_time)
                 time.sleep(random.uniform(0.8, 2))
             else:
-                time.sleep(5)
+                print(f"当前页面不在任务应用内: {package_name}")
+                time.sleep(2)
         except Exception as e:
-            time.sleep(5)
+            print(f"task_loop异常: {e}")
+            time.sleep(2)
     back_func()
 
 

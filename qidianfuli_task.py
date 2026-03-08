@@ -8,9 +8,9 @@ from utils import easy_ocr, get_current_app, get_connected_devices, select_devic
 PREFERRED_DEVICE = "192.168.70.154:39931"
 
 TASK_SPECS = [
-    {"name": "激励任务", "keywords": ["激励任务"]},
+    {"name": "激励任务", "keywords": ["激励任务"], "max_clicks": 10},
     {"name": "惊喜福利", "keywords": ["做任务领惊喜福利", "惊喜福利"]},
-    {"name": "3个广告任务", "keywords": ["完成3个广告任务得奖励", "3个广告任务"]},
+    {"name": "3个广告任务", "keywords": ["完成3个广告任务得奖励", "3个广告任务"], "max_clicks": 3},
     {"name": "1个广告任务", "keywords": ["完成1个广告任务得奖励", "1个广告任务"]},
 ]
 
@@ -274,6 +274,7 @@ def try_close_ad_layer(d, items):
 
 
 def recover_to_welfare_page(d, max_rounds=10):
+    rewardvideo_streak = 0
     for idx in range(max_rounds):
         items = ocr_items(d)
         pkg, activity = get_current_app(d)
@@ -285,6 +286,7 @@ def recover_to_welfare_page(d, max_rounds=10):
             print("[recover] 已回到福利任务页")
             return True
         if "ADActivity" in activity and "RewardvideoPortraitADActivity" not in activity:
+            rewardvideo_streak = 0
             print("[recover] 命中 ADActivity，优先点击左上返回区")
             w, h = d.window_size()
             for pt in [(int(w * 0.06), int(h * 0.06)), (int(w * 0.10), int(h * 0.07)), (40, 90)]:
@@ -302,6 +304,7 @@ def recover_to_welfare_page(d, max_rounds=10):
             time.sleep(1.0)
             continue
         if "RewardvideoPortraitADActivity" in activity:
+            rewardvideo_streak += 1
             print("[recover] 命中 Rewardvideo 页面，执行角点关闭 + 双 back")
             w, h = d.window_size()
             if click_text_candidate(d, items, ["X", "×", "✕", "关闭", "跳过"], region="top-left"):
@@ -321,7 +324,13 @@ def recover_to_welfare_page(d, max_rounds=10):
             time.sleep(0.8)
             d.press("back")
             time.sleep(1.0)
+            if rewardvideo_streak >= 5:
+                print("[recover] Rewardvideo 连续卡住，强制重启起点")
+                start_app(d, QD_APP, init=True)
+                time.sleep(2.2)
+                rewardvideo_streak = 0
             continue
+        rewardvideo_streak = 0
         if "MainGroupActivity" in activity:
             print("[recover] 已退回主界面，尝试重新进入福利中心")
             # 先尝试进入“我”标签
@@ -544,6 +553,47 @@ def choose_device_for_qidianfuli(preferred_device=PREFERRED_DEVICE):
     return select_device()
 
 
+def bootstrap_to_welfare_center(d, max_rounds=8):
+    print("初始化：强制启动起点并进入福利中心")
+    start_app(d, QD_APP, init=True)
+    time.sleep(3.0)
+
+    for i in range(max_rounds):
+        items = ocr_items(d)
+        _, activity = get_current_app(d)
+        activity = activity or ""
+        if is_in_welfare_page(items, activity):
+            print("初始化完成：已在福利任务页")
+            return True
+
+        if "MainGroupActivity" in activity:
+            # 进入“我”
+            if not (d(text="我").click_exists(timeout=0.6) or d(text="我的").click_exists(timeout=0.6)):
+                click_text_candidate(d, items, ["我", "我的"], region="all")
+            time.sleep(1.2)
+            # 点击“福利中心”
+            hit = False
+            for _ in range(4):
+                nitems = ocr_items(d)
+                if click_text_candidate(d, nitems, ["福利中心"], region="all"):
+                    time.sleep(2.2)
+                    hit = True
+                    break
+                d.swipe_ext("up", scale=0.2)
+                time.sleep(1.0)
+            if hit:
+                continue
+
+        # 其他页面用回退恢复
+        print(f"初始化第 {i + 1}/{max_rounds} 轮：尝试回退恢复到福利页")
+        if recover_to_welfare_page(d, max_rounds=6):
+            return True
+        start_app(d, QD_APP, init=False)
+        time.sleep(2.0)
+
+    return False
+
+
 def run_qidian_fuli_tasks(d):
     print("开始执行 qidian 福利中心广告任务（仅“完成任务得奖励”卡片）")
 
@@ -565,61 +615,128 @@ def run_qidian_fuli_tasks(d):
     }
     task_report = []
 
+    def ensure_welfare_ready(stage):
+        items_now = ocr_items(d)
+        _, act_now = get_current_app(d)
+        if is_in_welfare_page(items_now, act_now):
+            return True
+        print(f"[ensure] {stage}: 当前不在福利页，先回退恢复")
+        if recover_to_welfare_page(d, max_rounds=10):
+            return True
+        print(f"[ensure] {stage}: 回退失败，执行初始化重进福利中心")
+        return bootstrap_to_welfare_center(d, max_rounds=4)
+
     for spec in TASK_SPECS:
+        if not ensure_welfare_ready(f"任务开始-{spec['name']}"):
+            task_report.append(
+                {
+                    "task": spec["name"],
+                    "status": "executed_failed",
+                    "note": "无法恢复到福利任务页，任务终止",
+                }
+            )
+            stats["executed_failed"] += 1
+            break
         print(f"准备处理任务: {spec['name']}")
         handled = False
         task_status = "not_found"
         task_note = "未定位到任务行"
+        max_clicks = int(spec.get("max_clicks", 1))
+        executed_times = 0
+        stop_by_non_pending = False
 
-        for attempt in range(6):
-            items = ocr_items(d)
-            anchor_y = find_anchor_y(items)
-            row, action = find_task_row_and_action(items, spec, anchor_y=anchor_y)
+        for run_idx in range(max_clicks):
+            if not ensure_welfare_ready(f"{spec['name']}-第{run_idx + 1}轮"):
+                handled = True
+                task_status = "executed_failed"
+                task_note = f"{spec['name']} 第{run_idx + 1}轮前无法恢复到福利页"
+                stats["executed_failed"] += 1
+                break
+            print(f"{spec['name']} 第 {run_idx + 1}/{max_clicks} 轮检查")
+            round_finished = False
+            for attempt in range(6):
+                items = ocr_items(d)
+                anchor_y = find_anchor_y(items)
+                row, action = find_task_row_and_action(items, spec, anchor_y=anchor_y)
 
-            if row is None:
-                d.swipe_ext("up", scale=0.24)
-                time.sleep(1.2)
-                continue
+                if row is None:
+                    d.swipe_ext("up", scale=0.24)
+                    time.sleep(1.2)
+                    continue
 
-            if action is None:
+                if action is None:
+                    task_status = "unknown_action"
+                    task_note = f"任务行已找到，但未识别到右侧动作按钮（第{attempt + 1}次）"
+                    d.swipe_ext("up", scale=0.18)
+                    time.sleep(1.0)
+                    continue
+
+                action_text = action["text"]
+                print(f"任务行命中: {row['raw_text']} | 动作: {action_text}")
+
+                is_pending = any(k in action_text for k in PENDING_ACTION_TEXTS)
+
+                # 多轮任务：只要按钮不再是“去完成/去领取”，即视作该任务已完成
+                if max_clicks > 1 and not is_pending:
+                    handled = True
+                    stop_by_non_pending = True
+                    task_status = "executed_success" if executed_times > 0 else "already_done"
+                    task_note = f"执行{executed_times}次后按钮变为: {action['raw_text']}"
+                    if executed_times > 0:
+                        stats["executed_success"] += 1
+                    else:
+                        stats["already_done"] += 1
+                    round_finished = True
+                    break
+
+                if any(k in action_text for k in DONE_ACTION_TEXTS):
+                    print("该任务已完成或暂不可执行，跳过")
+                    handled = True
+                    task_status = "already_done"
+                    task_note = f"按钮状态: {action['raw_text']}"
+                    stats["already_done"] += 1
+                    round_finished = True
+                    break
+
+                if is_pending:
+                    click_center(d, action)
+                    time.sleep(2.0)
+                    flow_ok = execute_after_click_task(d, timeout=210)
+                    back_ok = recover_to_welfare_page(d, max_rounds=10)
+                    if not back_ok:
+                        back_ok = ensure_welfare_ready(f"{spec['name']}-第{executed_times + 1}次执行后")
+                    handled = True
+                    executed_times += 1
+                    if flow_ok or back_ok:
+                        task_status = "executed_success"
+                        task_note = f"已执行{executed_times}次，当前按钮: {action['raw_text']}"
+                        round_finished = True
+                        break
+                    task_status = "executed_failed"
+                    task_note = f"第{executed_times}次执行后回退异常: {action['raw_text']}"
+                    stats["executed_failed"] += 1
+                    round_finished = True
+                    break
+
+                # 未知动作（既不是已完成也不是去完成），不执行点击，避免误触
                 task_status = "unknown_action"
-                task_note = f"任务行已找到，但未识别到右侧动作按钮（第{attempt + 1}次）"
+                task_note = f"检测到未知按钮文案，已跳过: {action['raw_text']}"
                 d.swipe_ext("up", scale=0.18)
                 time.sleep(1.0)
-                continue
 
-            action_text = action["text"]
-            print(f"任务行命中: {row['raw_text']} | 动作: {action_text}")
-
-            if any(k in action_text for k in DONE_ACTION_TEXTS):
-                print("该任务已完成或暂不可执行，跳过")
-                handled = True
-                task_status = "already_done"
-                task_note = f"按钮状态: {action['raw_text']}"
-                stats["already_done"] += 1
+            # 单轮任务执行一次就结束；多轮任务执行成功后继续下一轮，直到按钮非 pending
+            if not round_finished:
                 break
-
-            if any(k in action_text for k in PENDING_ACTION_TEXTS):
-                click_center(d, action)
-                time.sleep(2.0)
-                flow_ok = execute_after_click_task(d, timeout=210)
-                back_ok = recover_to_welfare_page(d, max_rounds=10)
-                handled = True
-                if flow_ok or back_ok:
-                    task_status = "executed_success"
-                    task_note = f"已执行: {action['raw_text']}"
+            if task_status == "executed_failed":
+                break
+            if task_status == "already_done":
+                break
+            if max_clicks == 1:
+                if task_status == "executed_success":
                     stats["executed_success"] += 1
-                else:
-                    task_status = "executed_failed"
-                    task_note = f"执行后回退异常: {action['raw_text']}"
-                    stats["executed_failed"] += 1
                 break
-
-            # 未知动作（既不是已完成也不是去完成），不执行点击，避免误触
-            task_status = "unknown_action"
-            task_note = f"检测到未知按钮文案，已跳过: {action['raw_text']}"
-            d.swipe_ext("up", scale=0.18)
-            time.sleep(1.0)
+            if stop_by_non_pending:
+                break
 
         if not handled:
             print(f"未成功执行任务: {spec['name']}（可能不在当前批次或已隐藏）")
@@ -627,6 +744,10 @@ def run_qidian_fuli_tasks(d):
                 stats["not_found"] += 1
             elif task_status == "unknown_action":
                 stats["not_found"] += 1
+        elif max_clicks > 1 and task_status == "executed_success" and not stop_by_non_pending:
+            # 多轮任务达到 max_clicks 上限，视作一次成功
+            stats["executed_success"] += 1
+            task_note = f"已执行至上限{max_clicks}次，最终按钮仍可执行"
 
         task_report.append(
             {
@@ -652,6 +773,8 @@ def run_qidian_fuli_tasks(d):
 def main():
     device_id = choose_device_for_qidianfuli()
     d = u2.connect(device_id)
+    if not bootstrap_to_welfare_center(d, max_rounds=8):
+        raise RuntimeError("初始化失败：未能自动进入起点福利中心")
     run_qidian_fuli_tasks(d)
 
 
