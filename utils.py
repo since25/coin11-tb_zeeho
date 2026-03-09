@@ -22,7 +22,7 @@ opener = urllib.request.build_opener(
 urllib.request.install_opener(opener)
 
 # from paddleocr import PaddleOCR
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:
     import easyocr
@@ -316,7 +316,26 @@ def _normalize_pytesseract_result(tsv_data, image_size=None):
             [left, bottom],
         ]
         normalized.append((bbox, str(text), conf / 100.0))
+    normalized.sort(key=lambda item: (item[0][0][1], item[0][0][0]))
     return normalized
+
+
+def _prepare_pytesseract_image(image):
+    """
+    对整页截图做轻量预处理，提升 Ubuntu 上中文任务页识别稳定性。
+    """
+    pil_img = image if isinstance(image, Image.Image) else Image.fromarray(np.array(image))
+    pil_img = ImageOps.exif_transpose(pil_img).convert("L")
+
+    width, height = pil_img.size
+    scale = 1.0
+    if max(width, height) < 2200:
+        scale = 1.6
+    if scale != 1.0:
+        pil_img = pil_img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
+
+    pil_img = ImageOps.autocontrast(pil_img)
+    return pil_img
 
 def easy_ocr(image, return_info=False):
     global easyocr_reader, _ocr_backend_logged, _easyocr_device_logged
@@ -346,16 +365,16 @@ def easy_ocr(image, return_info=False):
     use_tesseract = backend_pref in ("auto", "pytesseract", "tesseract")
     if (not result) and use_tesseract and pytesseract is not None:
         try:
-            pil_img = image if isinstance(image, Image.Image) else Image.fromarray(np.array(image))
+            pil_img = _prepare_pytesseract_image(image)
             tsv_data = pytesseract.image_to_data(
                 pil_img,
                 lang="chi_sim+eng",
                 output_type=pytesseract.Output.DICT,
-                config="--psm 6",
+                config="--oem 3 --psm 11",
             )
             result = _normalize_pytesseract_result(tsv_data, image_size=pil_img.size)
             if result and not _ocr_backend_logged:
-                print("OCR 后端: pytesseract")
+                print("OCR 后端: pytesseract (--psm 11)")
                 _ocr_backend_logged = True
         except Exception as e:
             print(f"pytesseract 识别失败: {e}")

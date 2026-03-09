@@ -1,6 +1,7 @@
 import re
 import time
 import random
+import xml.etree.ElementTree as ET
 import uiautomator2 as u2
 
 from utils import easy_ocr, get_current_app, get_connected_devices, select_device, QD_APP, start_app
@@ -16,6 +17,9 @@ TASK_SPECS = [
 
 PENDING_ACTION_TEXTS = ["去完成", "去领取", "领奖励"]
 DONE_ACTION_TEXTS = ["已完成", "已领取", "明日再来", "已达上限", "已结束"]
+WELFARE_HINT_WORDS = ["福利中心", "完成任务得奖励", "去完成", "去领取", "激励任务", "惊喜福利", "广告任务", "领奖励"]
+WELFARE_ACTIVITY_HINTS = ("Browser", "QDBrowserActivity")
+AD_LAYER_HINT_WORDS = ["点击后", "进入详情页", "第三方应用", "放弃奖励", "现在退出就没有奖励", "继续观看", "查看详情"]
 
 
 def normalize_text(text):
@@ -58,6 +62,227 @@ def ocr_items(d):
     return result
 
 
+def parse_bounds(bounds):
+    nums = re.findall(r"\d+", bounds or "")
+    if len(nums) != 4:
+        return None
+    x1, y1, x2, y2 = map(int, nums)
+    return x1, y1, x2, y2
+
+
+def hierarchy_items(d):
+    items = []
+    try:
+        root = ET.fromstring(d.dump_hierarchy())
+    except Exception:
+        return items
+    for node in root.iter("node"):
+        text = (node.get("text") or node.get("content-desc") or "").strip()
+        bounds = parse_bounds(node.get("bounds") or "")
+        if not text or not bounds:
+            continue
+        x1, y1, x2, y2 = bounds
+        items.append(
+            {
+                "text": normalize_text(text),
+                "raw_text": text,
+                "conf": 1.0,
+                "bbox": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                "cx": int((x1 + x2) / 2),
+                "cy": int((y1 + y2) / 2),
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "resource_id": node.get("resource-id") or "",
+                "class_name": node.get("class") or "",
+                "clickable": (node.get("clickable") == "true"),
+            }
+        )
+    items.sort(key=lambda x: (x["cy"], x["x1"]))
+    return items
+
+
+def page_items(d, prefer_hierarchy=False):
+    pkg, activity = get_current_app(d)
+    activity = activity or ""
+    use_hierarchy = prefer_hierarchy or pkg == QD_APP or "Browser" in activity or "MainGroupActivity" in activity
+    if use_hierarchy:
+        items = hierarchy_items(d)
+        if items:
+            return items
+    return ocr_items(d)
+
+
+def welfare_task_rows(d):
+    rows = []
+    try:
+        root = ET.fromstring(d.dump_hierarchy())
+    except Exception:
+        return rows
+
+    for node in root.iter("node"):
+        rid = node.get("resource-id") or ""
+        if not rid.startswith("task_row_"):
+            continue
+        bounds = parse_bounds(node.get("bounds") or "")
+        if not bounds:
+            continue
+        texts = []
+        action = None
+        for child in node.iter("node"):
+            text = normalize_text(child.get("text") or "")
+            if text:
+                texts.append(text)
+            if text in PENDING_ACTION_TEXTS + DONE_ACTION_TEXTS:
+                cb = parse_bounds(child.get("bounds") or "")
+                if not cb:
+                    continue
+                cx = int((cb[0] + cb[2]) / 2)
+                cy = int((cb[1] + cb[3]) / 2)
+                action = {
+                    "text": text,
+                    "raw_text": child.get("text") or text,
+                    "cx": cx,
+                    "cy": cy,
+                    "x1": cb[0],
+                    "y1": cb[1],
+                    "x2": cb[2],
+                    "y2": cb[3],
+                }
+        rows.append(
+            {
+                "resource_id": rid,
+                "texts": texts,
+                "full_text": "".join(texts),
+                "cy": int((bounds[1] + bounds[3]) / 2),
+                "x1": bounds[0],
+                "y1": bounds[1],
+                "x2": bounds[2],
+                "y2": bounds[3],
+                "action": action,
+            }
+        )
+    rows.sort(key=lambda x: x["cy"])
+    return rows
+
+
+def is_welfare_task_page(d, items=None, activity=None):
+    if items is None:
+        items = page_items(d, prefer_hierarchy=True)
+    full_text = compact_page_text(items)
+    rows = welfare_task_rows(d)
+    if rows:
+        return True
+    if activity is None:
+        _, activity = get_current_app(d)
+    activity = activity or ""
+    has_anchor = "完成任务得奖励" in full_text
+    has_action = "去完成" in full_text or "去领取" in full_text or "领奖励" in full_text
+    return ("QDBrowserActivity" in activity or "Browser" in activity) and has_anchor and has_action
+
+
+def click_me_tab(d):
+    me_candidates = [
+        d(resourceIdMatches=r".*tab_me.*|.*f6.*", text="我的"),
+        d(resourceId="com.qidian.QDReader:id/view_tab_title_title", text="我"),
+        d(text="我"),
+        d(text="我的"),
+    ]
+    for sel in me_candidates:
+        try:
+            if sel.exists:
+                sel.click()
+                return True
+        except Exception:
+            pass
+
+    try:
+        root = ET.fromstring(d.dump_hierarchy())
+        for node in root.iter("node"):
+            if (node.get("text") or "").strip() != "我":
+                continue
+            bounds = parse_bounds(node.get("bounds") or "")
+            if not bounds:
+                continue
+            x1, y1, x2, y2 = bounds
+            d.click(int((x1 + x2) / 2), int((y1 + y2) / 2))
+            return True
+    except Exception:
+        pass
+
+    # 三星设备底部 tab 的稳定中心区域，避免点到导航栏边缘
+    w, h = d.window_size()
+    d.click(int(w * 0.875), int(h * 0.952))
+    return True
+
+
+def force_back_to_maingroup(d, max_steps=8):
+    for step in range(max_steps):
+        pkg, activity = get_current_app(d)
+        activity = activity or ""
+        if pkg != QD_APP:
+            d.press("back")
+            time.sleep(1.0)
+            continue
+        if "MainGroupActivity" in activity:
+            return True
+        if "QDBrowserActivity" in activity:
+            return True
+        d.press("back")
+        time.sleep(1.0)
+    pkg, activity = get_current_app(d)
+    activity = activity or ""
+    return pkg == QD_APP and ("MainGroupActivity" in activity or "QDBrowserActivity" in activity)
+
+
+def group_items_by_line(items, y_tolerance=42):
+    lines = []
+    for item in sorted(items, key=lambda x: (x["cy"], x["x1"])):
+        target = None
+        best_delta = None
+        for line in lines:
+            delta = abs(item["cy"] - line["cy"])
+            if delta > y_tolerance:
+                continue
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                target = line
+        if target is None:
+            lines.append({"cy": item["cy"], "items": [item]})
+            continue
+        target["items"].append(item)
+        target["cy"] = int(sum(i["cy"] for i in target["items"]) / len(target["items"]))
+    for line in lines:
+        line["items"].sort(key=lambda x: x["x1"])
+        line["text"] = "".join(i["text"] for i in line["items"])
+    lines.sort(key=lambda x: x["cy"])
+    return lines
+
+
+def compact_page_text(items):
+    return "".join(i["text"] for i in sorted(items, key=lambda x: (x["cy"], x["x1"])))
+
+
+def build_virtual_item(text, source_items):
+    xs1 = [i["x1"] for i in source_items]
+    ys1 = [i["y1"] for i in source_items]
+    xs2 = [i["x2"] for i in source_items]
+    ys2 = [i["y2"] for i in source_items]
+    return {
+        "text": text,
+        "raw_text": text,
+        "conf": min((float(i["conf"]) for i in source_items), default=0.0),
+        "bbox": [[min(xs1), min(ys1)], [max(xs2), min(ys1)], [max(xs2), max(ys2)], [min(xs1), max(ys2)]],
+        "cx": int((min(xs1) + max(xs2)) / 2),
+        "cy": int((min(ys1) + max(ys2)) / 2),
+        "x1": min(xs1),
+        "y1": min(ys1),
+        "x2": max(xs2),
+        "y2": max(ys2),
+    }
+
+
 def click_center(d, item):
     d.click(item["cx"], item["cy"])
 
@@ -70,15 +295,26 @@ def is_reward_popup_text(full_text):
 
 
 def is_in_welfare_page(items, activity):
-    full_text = " ".join(i["text"] for i in items)
-    welfare_words = ["福利中心", "完成任务得奖励", "去完成", "激励任务", "惊喜福利", "广告任务"]
-    return ("Browser" in (activity or "") or "QDBrowserActivity" in (activity or "")) and any(
-        w in full_text for w in welfare_words
+    full_text = compact_page_text(items)
+    activity = activity or ""
+    keyword_hits = sum(1 for w in WELFARE_HINT_WORDS if w in full_text)
+    has_task_layout = ("去完成" in full_text or "去领取" in full_text) and any(
+        w in full_text for w in ["激励任务", "惊喜福利", "广告任务", "奖励"]
     )
+    return (
+        any(hint in activity for hint in WELFARE_ACTIVITY_HINTS) and (keyword_hits >= 1 or has_task_layout)
+    ) or (keyword_hits >= 2) or has_task_layout
 
 
 def find_anchor_y(items):
-    anchors = [i for i in items if "完成任务得奖励" in i["text"]]
+    anchors = [
+        i for i in items
+        if "完成任务得奖励" in i["text"] or ("任务" in i["text"] and "奖励" in i["text"])
+    ]
+    if not anchors:
+        for line in group_items_by_line(items):
+            if "完成任务得奖励" in line["text"] or ("任务" in line["text"] and "奖励" in line["text"]):
+                anchors.append(build_virtual_item(line["text"], line["items"]))
     if not anchors:
         return None
     anchors.sort(key=lambda x: x["conf"], reverse=True)
@@ -95,6 +331,15 @@ def find_action_near_row(items, row_item, y_tolerance=120):
         if any(t in i["text"] for t in PENDING_ACTION_TEXTS + DONE_ACTION_TEXTS):
             candidates.append(i)
     if not candidates:
+        line_items = [
+            i for i in items
+            if i["cx"] > row_item["cx"] and abs(i["cy"] - row_item["cy"]) <= y_tolerance
+        ]
+        if line_items:
+            merged = "".join(i["text"] for i in sorted(line_items, key=lambda x: x["x1"]))
+            for text in PENDING_ACTION_TEXTS + DONE_ACTION_TEXTS:
+                if text in merged:
+                    return build_virtual_item(text, line_items)
         return None
     candidates.sort(key=lambda x: (abs(x["cy"] - row_item["cy"]), -x["cx"]))
     return candidates[0]
@@ -103,11 +348,17 @@ def find_action_near_row(items, row_item, y_tolerance=120):
 def find_task_row_and_action(items, spec, anchor_y=None):
     rows = []
     for i in items:
-        if not any(k in i["text"] for k in spec["keywords"]):
-            continue
-        if anchor_y is not None and i["cy"] < anchor_y - 30:
-            continue
-        rows.append(i)
+        if any(k in i["text"] for k in spec["keywords"]):
+            if anchor_y is not None and i["cy"] < anchor_y - 30:
+                continue
+            rows.append(i)
+    if not rows:
+        for line in group_items_by_line(items):
+            if not any(k in line["text"] for k in spec["keywords"]):
+                continue
+            if anchor_y is not None and line["cy"] < anchor_y - 30:
+                continue
+            rows.append(build_virtual_item(line["text"], line["items"]))
     if not rows:
         return None, None
     rows.sort(key=lambda x: x["cy"])
@@ -122,29 +373,13 @@ def enter_welfare_center_selector_first(d, max_rounds=6):
     该函数对 OCR 质量依赖更低，适合 Linux + pytesseract 场景。
     """
     # 1) 先确保进入“我/我的”页
-    me_candidates = [
-        d(resourceIdMatches=r".*tab_me.*|.*f6.*", text="我的"),
-        d(resourceId="com.qidian.QDReader:id/view_tab_title_title", text="我"),
-        d(text="我"),
-        d(text="我的"),
-    ]
-    clicked_me = False
-    for sel in me_candidates:
-        try:
-            if sel.exists:
-                sel.click()
-                clicked_me = True
-                break
-        except Exception:
-            pass
+    clicked_me = click_me_tab(d)
     if not clicked_me:
-        items = ocr_items(d)
+        items = page_items(d, prefer_hierarchy=True)
         if click_text_candidate(d, items, ["我的", "我"], region="all"):
             clicked_me = True
     if not clicked_me:
-        # 极端兜底：底部右侧“我”标签附近
-        w, h = d.window_size()
-        d.click(int(w * 0.90), int(h * 0.965))
+        click_me_tab(d)
     time.sleep(1.8)
 
     # 2) 在“我”页找“福利中心”
@@ -167,7 +402,7 @@ def enter_welfare_center_selector_first(d, max_rounds=6):
             return True
 
         # OCR 兜底
-        items = ocr_items(d)
+        items = page_items(d, prefer_hierarchy=True)
         if click_text_candidate(d, items, ["福利中心"], region="all"):
             time.sleep(2.5)
             return True
@@ -181,7 +416,10 @@ def enter_welfare_center_selector_first(d, max_rounds=6):
 
 def scroll_to_task_panel(d, max_rounds=8):
     for idx in range(max_rounds):
-        items = ocr_items(d)
+        rows = welfare_task_rows(d)
+        if rows:
+            return True
+        items = page_items(d, prefer_hierarchy=True)
         has_anchor = find_anchor_y(items) is not None
         has_any_task = any(
             any(k in i["text"] for k in spec["keywords"]) for spec in TASK_SPECS for i in items
@@ -209,6 +447,18 @@ def click_text_candidate(d, items, keywords, region="all", prefer_bottom=False):
             if not (i["cy"] < int(height * 0.34) and i["cx"] < int(width * 0.45)):
                 continue
         candidates.append(i)
+    if not candidates:
+        for line in group_items_by_line(items):
+            if not any(k in line["text"] for k in keywords):
+                continue
+            virtual = build_virtual_item(line["text"], line["items"])
+            if region == "top-right":
+                if not (virtual["cy"] < int(height * 0.34) and virtual["cx"] > int(width * 0.55)):
+                    continue
+            elif region == "top-left":
+                if not (virtual["cy"] < int(height * 0.34) and virtual["cx"] < int(width * 0.45)):
+                    continue
+            candidates.append(virtual)
     if not candidates:
         return False
     if prefer_bottom:
@@ -276,10 +526,35 @@ def is_pre_countdown_gate(full_text):
     return any(w in full_text for w in gate_words)
 
 
+def click_rewardvideo_gate_cta(d):
+    """
+    腾讯激励视频前置页经常把 CTA 画成无文本自定义控件。
+    这里优先点击实测稳定的底部 CTA 区域。
+    """
+    w, h = d.window_size()
+    hot_points = [
+        (w // 2, int(h * 0.805)),
+        (w // 2, int(h * 0.835)),
+        (int(w * 0.72), int(h * 0.805)),
+    ]
+    for x, y in hot_points:
+        d.click(x, y)
+        print(f"[gate] 已点击前置页 CTA 热区: ({x},{y})")
+        time.sleep(1.5)
+        pkg, act = get_current_app(d)
+        act = act or ""
+        if pkg != QD_APP or "RewardvideoPortraitADActivity" not in act:
+            return True
+    return False
+
+
 def advance_pre_countdown_gate(d, items):
     cta_words = ["点击去浏览", "去浏览", "查看详情", "去看看", "了解详情", "继续看", "继续观看", "立即下载", "下载领取", "去使用"]
     non_click_hints = ["进入详情页或第三方应用", "广告", "点击后", "可获得奖励"]
     w, h = d.window_size()
+
+    if click_rewardvideo_gate_cta(d):
+        return True
 
     # 优先点底部 CTA，避免点到正文“点击后...可获得奖励”
     bottom_candidates = []
@@ -339,7 +614,7 @@ def try_close_ad_layer(d, items):
 def recover_to_welfare_page(d, max_rounds=10):
     rewardvideo_streak = 0
     for idx in range(max_rounds):
-        items = ocr_items(d)
+        items = page_items(d, prefer_hierarchy=True)
         pkg, activity = get_current_app(d)
         activity = activity or ""
         full_text = " ".join(i["text"] for i in items)
@@ -408,7 +683,7 @@ def recover_to_welfare_page(d, max_rounds=10):
             start_app(d, QD_APP, init=True)
             time.sleep(2.0)
             continue
-        if any(k in full_text for k in ["奖励", "广告", "详情", "点击后"]):
+        if any(k in full_text for k in AD_LAYER_HINT_WORDS):
             print("[recover] 疑似广告层，优先尝试关闭控件")
         if try_close_ad_layer(d, items):
             time.sleep(1)
@@ -434,6 +709,7 @@ def execute_after_click_task(d, timeout=210):
     landing_rounds = 0
     external_return_attempts = 0
     gate_post_stall_hits = 0
+    rewardvideo_gate_hits = 0
 
     while time.time() - start < timeout:
         pkg, activity = get_current_app(d)
@@ -489,6 +765,22 @@ def execute_after_click_task(d, timeout=210):
             continue
         else:
             internal_landing_since = None
+
+        # 激励视频页常先出现“现在退出就没有奖励哦/点击去浏览”前置层。
+        # 这时不能过早 back，优先点底部固定 CTA 触发正式计时。
+        if "RewardvideoPortraitADActivity" in activity:
+            sec0 = detect_countdown_seconds(full_text)
+            if sec0 is None and landing_rounds == 0:
+                rewardvideo_gate_hits += 1
+                print(f"[rewardvideo-gate] 未检测到倒计时，优先点击前置 CTA，第 {rewardvideo_gate_hits} 次")
+                if click_rewardvideo_gate_cta(d):
+                    time.sleep(2.0)
+                    continue
+                if rewardvideo_gate_hits <= 5:
+                    time.sleep(1.5)
+                    continue
+            else:
+                rewardvideo_gate_hits = 0
 
         if is_pre_countdown_gate(full_text):
             if landing_rounds >= 1:
@@ -584,6 +876,11 @@ def execute_after_click_task(d, timeout=210):
             time.sleep(1.2)
             continue
 
+        if "RewardvideoPortraitADActivity" in activity and rewardvideo_gate_hits > 0:
+            print("[rewardvideo-gate] 仍在前置页，暂不执行 back")
+            time.sleep(1.2)
+            continue
+
         d.press("back")
         time.sleep(1.2)
 
@@ -611,10 +908,11 @@ def bootstrap_to_welfare_center(d, max_rounds=8):
     time.sleep(3.0)
 
     for i in range(max_rounds):
-        items = ocr_items(d)
+        force_back_to_maingroup(d, max_steps=5)
+        items = page_items(d, prefer_hierarchy=True)
         _, activity = get_current_app(d)
         activity = activity or ""
-        if is_in_welfare_page(items, activity):
+        if is_welfare_task_page(d, items, activity):
             print("初始化完成：已在福利任务页")
             return True
 
@@ -636,9 +934,9 @@ def run_qidian_fuli_tasks(d):
     print("开始执行 qidian 福利中心广告任务（仅“完成任务得奖励”卡片）")
 
     # 预处理：如果当前残留在广告页/外部页，先回到福利中心
-    items0 = ocr_items(d)
+    items0 = page_items(d, prefer_hierarchy=True)
     _, activity0 = get_current_app(d)
-    if not is_in_welfare_page(items0, activity0):
+    if not is_welfare_task_page(d, items0, activity0):
         print("当前不在福利任务页，先执行回退恢复")
         recover_to_welfare_page(d, max_rounds=15)
 
@@ -654,9 +952,9 @@ def run_qidian_fuli_tasks(d):
     task_report = []
 
     def ensure_welfare_ready(stage):
-        items_now = ocr_items(d)
+        items_now = page_items(d, prefer_hierarchy=True)
         _, act_now = get_current_app(d)
-        if is_in_welfare_page(items_now, act_now):
+        if is_welfare_task_page(d, items_now, act_now):
             return True
         print(f"[ensure] {stage}: 当前不在福利页，先回退恢复")
         if recover_to_welfare_page(d, max_rounds=10):
@@ -693,9 +991,13 @@ def run_qidian_fuli_tasks(d):
             print(f"{spec['name']} 第 {run_idx + 1}/{max_clicks} 轮检查")
             round_finished = False
             for attempt in range(6):
-                items = ocr_items(d)
-                anchor_y = find_anchor_y(items)
-                row, action = find_task_row_and_action(items, spec, anchor_y=anchor_y)
+                rows = welfare_task_rows(d)
+                row = next((r for r in rows if any(k in r["full_text"] for k in spec["keywords"])), None)
+                action = row["action"] if row else None
+                if row is None:
+                    items = page_items(d, prefer_hierarchy=True)
+                    anchor_y = find_anchor_y(items)
+                    row, action = find_task_row_and_action(items, spec, anchor_y=anchor_y)
 
                 if row is None:
                     d.swipe_ext("up", scale=0.24)
@@ -710,7 +1012,8 @@ def run_qidian_fuli_tasks(d):
                     continue
 
                 action_text = action["text"]
-                print(f"任务行命中: {row['raw_text']} | 动作: {action_text}")
+                row_text = row.get("raw_text") or row.get("full_text") or row.get("text") or ""
+                print(f"任务行命中: {row_text} | 动作: {action_text}")
 
                 is_pending = any(k in action_text for k in PENDING_ACTION_TEXTS)
 

@@ -8,6 +8,7 @@ from utils import easy_ocr, get_connected_devices, get_current_app, QD_APP
 from qidianfuli_task import (
     choose_device_for_qidianfuli,
     bootstrap_to_welfare_center,
+    page_items,
     recover_to_welfare_page,
     detect_countdown_seconds,
 )
@@ -16,6 +17,7 @@ LOTTERY_ANCHOR_WORDS = ["做任务可抽奖"]
 LOTTERY_ACTION_WORDS = ["去看看", "去完成", "立即抽奖", "去抽奖", "抽奖"]
 LOTTERY_PLUS_ONE_WORDS = ["做任务抽奖机会+1", "抽奖机会+1", "任务抽奖机会+1", "机会+1"]
 DRAW_BUTTON_WORDS = ["立即抽奖", "去抽奖", "抽奖", "开始抽奖"]
+LOTTERY_MARQUEE_WORDS = ["再连签", "上周断签", "去补签", "领好礼"]
 
 
 def normalize_text(text):
@@ -31,6 +33,12 @@ def is_lottery_entry_text(t):
 
 
 def ocr_items(d):
+    pkg, act = get_current_app(d)
+    act = act or ""
+    if pkg == QD_APP and "RewardvideoPortraitADActivity" not in act and "ADActivity" not in act:
+        items = page_items(d, prefer_hierarchy=True)
+        if items:
+            return items
     out = []
     for item in easy_ocr(d.screenshot(), return_info=True):
         if not isinstance(item, (tuple, list)) or len(item) != 3:
@@ -70,7 +78,71 @@ def detect_lottery_chances(items):
     return None
 
 
+def click_by_text(items, d, target_text, prefer_right=False, y_min=None):
+    candidates = []
+    for it in items:
+        if target_text not in it["text"]:
+            continue
+        if y_min is not None and it["cy"] < y_min:
+            continue
+        candidates.append(it)
+    if not candidates:
+        return False
+    if prefer_right:
+        candidates.sort(key=lambda x: (-x["cx"], x["cy"]))
+    else:
+        candidates.sort(key=lambda x: (x["cy"], -x["cx"]))
+    t = candidates[0]
+    d.click(t["cx"], t["cy"])
+    print(f"点击文案: {t['raw_text']} @ ({t['cx']},{t['cy']})")
+    return True
+
+
+def click_lottery_marquee_entry(d):
+    items = ocr_items(d)
+    # 优先点滚动文案容器中部稳定区域，避免点到右侧箭头/空白
+    for it in items:
+        txt = it["text"]
+        if not any(k in txt for k in LOTTERY_MARQUEE_WORDS):
+            continue
+        if not (520 <= it["cy"] <= 760):
+            continue
+        if it["cx"] < 620:
+            continue
+        x = 825
+        y = 612
+        d.click(x, y)
+        print(f"已点击抽奖新入口滚动文案区: {it['raw_text']} @ ({x},{y})")
+        return True
+
+    # 兜底：福利页上该区域是稳定坐标
+    d.click(825, 612)
+    print("已按固定坐标点击抽奖新入口滚动文案区: (825,612)")
+    return True
+
+
+def open_lottery_page(d, max_rounds=4):
+    for idx in range(max_rounds):
+        items = ocr_items(d)
+        if click_by_text(items, d, "做任务可抽奖", prefer_right=True, y_min=1600):
+            time.sleep(2.0)
+            return True
+        if idx == 0:
+            click_lottery_marquee_entry(d)
+            time.sleep(3.0)
+            items = ocr_items(d)
+            if click_by_text(items, d, "做任务可抽奖", prefer_right=True, y_min=1600):
+                time.sleep(2.0)
+                return True
+        else:
+            d.swipe_ext("up", scale=0.18)
+        time.sleep(2.0)
+    return False
+
+
 def click_lottery_entry(d, max_rounds=6):
+    if open_lottery_page(d, max_rounds=2):
+        return True
     for idx in range(max_rounds):
         items = ocr_items(d)
         w, h = d.window_size()
