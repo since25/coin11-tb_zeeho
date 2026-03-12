@@ -70,6 +70,33 @@ def parse_bounds(bounds):
     return x1, y1, x2, y2
 
 
+def extract_cooldown_action(full_text, row_bounds=None):
+    full_text = normalize_text(full_text)
+    m = re.search(r"(剩余?|余)(\d{1,2}:\d{2}(?::\d{2})?)", full_text)
+    if not m:
+        m = re.search(r"(剩)(\d{1,2}:\d{2}(?::\d{2})?)", full_text)
+    if not m:
+        return None
+    text = f"剩{m.group(2)}"
+    action = {
+        "text": text,
+        "raw_text": text,
+    }
+    if row_bounds:
+        x1, y1, x2, y2 = row_bounds
+        action.update(
+            {
+                "cx": int(x1 + (x2 - x1) * 0.86),
+                "cy": int((y1 + y2) / 2),
+                "x1": int(x1 + (x2 - x1) * 0.72),
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+            }
+        )
+    return action
+
+
 def hierarchy_items(d):
     items = []
     try:
@@ -160,7 +187,7 @@ def welfare_task_rows(d):
                 "y1": bounds[1],
                 "x2": bounds[2],
                 "y2": bounds[3],
-                "action": action,
+                "action": action or extract_cooldown_action("".join(texts), row_bounds=bounds),
             }
         )
     rows.sort(key=lambda x: x["cy"])
@@ -364,6 +391,12 @@ def find_task_row_and_action(items, spec, anchor_y=None):
     rows.sort(key=lambda x: x["cy"])
     row = rows[0]
     action = find_action_near_row(items, row)
+    if action is None:
+        row_text = row.get("raw_text") or row.get("full_text") or row.get("text") or ""
+        row_bounds = None
+        if all(k in row for k in ("x1", "y1", "x2", "y2")):
+            row_bounds = (row["x1"], row["y1"], row["x2"], row["y2"])
+        action = extract_cooldown_action(row_text, row_bounds=row_bounds)
     return row, action
 
 
@@ -470,18 +503,85 @@ def click_text_candidate(d, items, keywords, region="all", prefer_bottom=False):
 
 
 def close_reward_popup_if_any(d, items=None):
+    hier_items = hierarchy_items(d)
+    full_text_hier = " ".join(i["text"] for i in hier_items)
     if items is None:
-        items = ocr_items(d)
+        items = hier_items or ocr_items(d)
     full_text = " ".join(i["text"] for i in items)
     if not is_reward_popup_text(full_text):
-        return False
-    if click_text_candidate(d, items, ["我知道了", "知道了", "确定", "收下"], region="all"):
+        if not is_reward_popup_text(full_text_hier):
+            return False
+        full_text = full_text_hier
+        if hier_items:
+            items = hier_items
+
+    ack_selectors = [
+        d(text="我知道了"),
+        d(text="知道了"),
+        d(text="确定"),
+        d(text="收下"),
+        d(textMatches=r"^(我知道了|知道了|确定|收下)$"),
+    ]
+    for sel in ack_selectors:
+        try:
+            if sel.exists:
+                sel.click()
+                time.sleep(1)
+                return True
+        except Exception:
+            pass
+
+    if click_text_candidate(d, items, ["我知道了", "知道了", "确定", "收下"], region="all", prefer_bottom=True):
         time.sleep(1)
         return True
     w, h = d.window_size()
     d.click(w // 2, int(h * 0.82))
     time.sleep(1)
     return True
+
+
+def close_system_permission_dialog_if_any(d, items=None):
+    pkg, activity = get_current_app(d)
+    activity = activity or ""
+    if items is None:
+        items = page_items(d, prefer_hierarchy=True)
+    full_text = compact_page_text(items)
+
+    permission_hints = [
+        "权限", "允许", "位置信息", "麦克风", "相机", "通讯录", "通知",
+        "照片", "存储", "录音", "附近设备", "此设备的位置", "仅在使用该应用时",
+    ]
+    is_permission_page = (
+        "GrantPermissionsActivity" in activity
+        or "permissioncontroller" in pkg
+        or any(h in full_text for h in permission_hints)
+    )
+    if not is_permission_page:
+        return False
+
+    selectors = [
+        d(text="不允许"),
+        d(text="拒绝"),
+        d(text="仅限这一次"),
+        d(text="稍后再说"),
+        d(text="取消"),
+        d(textMatches=r"^(不允许|拒绝|仅限这一次|稍后再说|取消)$"),
+    ]
+    for sel in selectors:
+        try:
+            if sel.exists:
+                sel.click()
+                print("[permission] 已处理系统权限弹窗")
+                time.sleep(1.0)
+                return True
+        except Exception:
+            pass
+
+    if click_text_candidate(d, items, ["不允许", "拒绝", "仅限这一次", "稍后再说", "取消"], region="all", prefer_bottom=True):
+        print("[permission] 已处理系统权限弹窗")
+        time.sleep(1.0)
+        return True
+    return False
 
 
 def detect_countdown_seconds(text):
@@ -524,6 +624,70 @@ def page_state_signature(pkg, activity, items):
 def is_pre_countdown_gate(full_text):
     gate_words = ["点击后", "可获得奖励", "点击去浏览", "放弃奖励", "现在退出就没有奖励", "进入详情页或第三方应用"]
     return any(w in full_text for w in gate_words)
+
+
+def is_rewardvideo_stuck_reward_page(full_text, items=None):
+    if "恭喜已获得奖励" not in full_text:
+        return False
+    if "立即下载" not in full_text:
+        return False
+    if "进入详情页或第三方应用" not in full_text:
+        return False
+    if items is not None and len(items) <= 3:
+        return True
+    return True
+
+
+def is_rewardvideo_recommend_popup(full_text):
+    popup_words = ["专属推荐", "去微信看看", "查看详情", "立即查看", "立即打开", "去看看", "了解更多"]
+    reward_gate_words = ["点击后", "看15秒可获得奖励", "进入详情页或第三方应用", "了解更多"]
+    return "专属推荐" in full_text or (
+        any(w in full_text for w in popup_words)
+        and not any(w in full_text for w in ["恭喜已获得奖励", "立即下载", "进入详情页或第三方应用"])
+    ) or (
+        any(w in full_text for w in reward_gate_words)
+        and "立即下载" not in full_text
+    )
+
+
+def try_close_rewardvideo_recommend_popup(d, items=None, source="gate"):
+    if items is None:
+        items = ocr_items(d)
+    full_text = compact_page_text(items)
+    if not is_rewardvideo_recommend_popup(full_text):
+        return False
+
+    if click_text_candidate(d, items, ["X", "×", "✕", "关闭"], region="top-left"):
+        time.sleep(0.8)
+        print(f"[{source}] 已点击前置卡左上关闭")
+        return True
+    if click_text_candidate(d, items, ["X", "×", "✕", "关闭"], region="top-right"):
+        time.sleep(0.8)
+        print(f"[{source}] 已点击前置卡右上关闭")
+        return True
+
+    w, h = d.window_size()
+    hot_points = [
+        (int(w * 0.94), int(h * 0.06)),
+        (int(w * 0.90), int(h * 0.08)),
+        (int(w * 0.88), int(h * 0.10)),
+        (int(w * 0.06), int(h * 0.06)),
+        (int(w * 0.08), int(h * 0.08)),
+        (int(w * 0.10), int(h * 0.10)),
+    ]
+    for x, y in hot_points:
+        d.click(x, y)
+        time.sleep(0.5)
+        pkg, activity = get_current_app(d)
+        if pkg != QD_APP or "RewardvideoPortraitADActivity" not in (activity or ""):
+            print(f"[{source}] 前置卡角点热区关闭成功: ({x},{y})")
+            return True
+        items2 = ocr_items(d)
+        full_text2 = compact_page_text(items2)
+        if not is_rewardvideo_recommend_popup(full_text2):
+            print(f"[{source}] 前置卡角点热区已关闭弹卡: ({x},{y})")
+            return True
+    return False
 
 
 def click_rewardvideo_gate_cta(d):
@@ -611,6 +775,127 @@ def try_close_ad_layer(d, items):
     return False
 
 
+def is_rewardvideo_page(pkg, activity):
+    return pkg == QD_APP and "RewardvideoPortraitADActivity" in (activity or "")
+
+
+def click_rewardvideo_exit_confirm(d, items=None):
+    if items is None:
+        items = ocr_items(d)
+    full_text = compact_page_text(items)
+    confirm_words = [
+        "放弃奖励", "确认退出", "仍要退出", "退出广告", "狠心离开",
+        "残忍离开", "退出并返回", "确认离开",
+    ]
+    exit_hints = [
+        "现在退出就没有奖励", "退出后将失去奖励", "放弃奖励", "确认退出",
+        "仍要退出", "退出广告", "离开将无法获得奖励",
+    ]
+    if not any(word in full_text for word in exit_hints + confirm_words):
+        return False
+
+    selectors = [
+        d(textMatches=r".*(放弃奖励|确认退出|仍要退出|退出广告|狠心离开|残忍离开|退出并返回|确认离开).*"),
+        d(descriptionMatches=r".*(放弃奖励|确认退出|仍要退出|退出广告|狠心离开|残忍离开|退出并返回|确认离开).*"),
+    ]
+    for sel in selectors:
+        try:
+            if sel.exists:
+                sel.click()
+                time.sleep(0.9)
+                return True
+        except Exception:
+            pass
+
+    if click_text_candidate(d, items, confirm_words, region="all", prefer_bottom=True):
+        time.sleep(0.9)
+        return True
+    return False
+
+
+def click_rewardvideo_continue_browse(d, items=None, source="gate"):
+    if items is None:
+        items = ocr_items(d)
+    full_text = compact_page_text(items)
+    continue_words = ["点击去浏览", "去浏览", "继续浏览", "继续观看", "继续看", "去查看", "查看详情"]
+    exit_hints = ["现在退出就没有奖励", "即可领取奖励", "点击广告浏览", "可获得奖励", "放弃奖励"]
+    if not any(word in full_text for word in exit_hints):
+        return False
+
+    if click_text_candidate(d, items, continue_words, region="all", prefer_bottom=True):
+        print(f"[{source}] 已点击继续浏览按钮")
+        time.sleep(1.0)
+        return True
+    return False
+
+
+def try_exit_rewardvideo_page(d, items=None, source="recover"):
+    pkg, activity = get_current_app(d)
+    activity = activity or ""
+    if not is_rewardvideo_page(pkg, activity):
+        return False
+    if items is None:
+        items = page_items(d, prefer_hierarchy=True)
+    full_text = compact_page_text(items)
+
+    # 这类“恭喜已获得奖励 + 立即下载”页面在真机上会拦截 back 和右上角点击。
+    # 奖励已经到账，直接重启起点比反复卡在 Rewardvideo 更稳。
+    if is_rewardvideo_stuck_reward_page(full_text, items):
+        print(f"[{source}] 命中 Rewardvideo 奖励卡死页，直接重启起点恢复")
+        start_app(d, QD_APP, init=True)
+        time.sleep(2.5)
+        return True
+
+    # 有些广告先弹退出确认框，优先点确认按钮，避免 back 只是在框内兜圈。
+    if click_rewardvideo_exit_confirm(d, items):
+        pkg, activity = get_current_app(d)
+        if not is_rewardvideo_page(pkg, activity):
+            print(f"[{source}] Rewardvideo 退出确认已生效")
+            return True
+        items = page_items(d, prefer_hierarchy=True)
+
+    if try_close_ad_layer(d, items):
+        pkg, activity = get_current_app(d)
+        if not is_rewardvideo_page(pkg, activity):
+            print(f"[{source}] Rewardvideo 角点关闭已生效")
+            return True
+        items = page_items(d, prefer_hierarchy=True)
+
+    w, h = d.window_size()
+    hot_points = [
+        (int(w * 0.06), int(h * 0.05)),
+        (int(w * 0.10), int(h * 0.08)),
+        (int(w * 0.12), int(h * 0.11)),
+        (int(w * 0.94), int(h * 0.05)),
+        (int(w * 0.90), int(h * 0.08)),
+        (int(w * 0.88), int(h * 0.11)),
+    ]
+    for x, y in hot_points:
+        d.click(x, y)
+        time.sleep(0.35)
+        pkg, activity = get_current_app(d)
+        if not is_rewardvideo_page(pkg, activity):
+            print(f"[{source}] Rewardvideo 角点热区命中: ({x},{y})")
+            return True
+
+    for step in range(2):
+        d.press("back")
+        time.sleep(0.9 if step == 0 else 1.1)
+        pkg, activity = get_current_app(d)
+        if not is_rewardvideo_page(pkg, activity):
+            print(f"[{source}] Rewardvideo back 已退出，第 {step + 1} 次")
+            return True
+        items = page_items(d, prefer_hierarchy=True)
+        if click_rewardvideo_exit_confirm(d, items):
+            pkg, activity = get_current_app(d)
+            if not is_rewardvideo_page(pkg, activity):
+                print(f"[{source}] Rewardvideo back 后确认退出成功")
+                return True
+            items = page_items(d, prefer_hierarchy=True)
+
+    return False
+
+
 def recover_to_welfare_page(d, max_rounds=10):
     rewardvideo_streak = 0
     for idx in range(max_rounds):
@@ -619,6 +904,8 @@ def recover_to_welfare_page(d, max_rounds=10):
         activity = activity or ""
         full_text = " ".join(i["text"] for i in items)
         print(f"[recover {idx + 1}/{max_rounds}] app={pkg}/{activity}")
+        if close_system_permission_dialog_if_any(d, items):
+            continue
         close_reward_popup_if_any(d, items)
         if is_in_welfare_page(items, activity):
             print("[recover] 已回到福利任务页")
@@ -643,25 +930,10 @@ def recover_to_welfare_page(d, max_rounds=10):
             continue
         if "RewardvideoPortraitADActivity" in activity:
             rewardvideo_streak += 1
-            print("[recover] 命中 Rewardvideo 页面，执行角点关闭 + 双 back")
-            w, h = d.window_size()
-            if click_text_candidate(d, items, ["X", "×", "✕", "关闭", "跳过"], region="top-left"):
-                time.sleep(0.5)
-            if click_text_candidate(d, items, ["X", "×", "✕", "关闭", "跳过"], region="top-right"):
-                time.sleep(0.5)
-            hot_points = [
-                (int(w * 0.06), int(h * 0.05)), (int(w * 0.10), int(h * 0.08)),
-                (int(w * 0.94), int(h * 0.05)), (int(w * 0.90), int(h * 0.08)),
-            ]
-            for x, y in hot_points:
-                d.click(x, y)
-                time.sleep(0.25)
-            if click_text_candidate(d, items, ["放弃奖励", "退出", "返回"], region="all", prefer_bottom=True):
-                time.sleep(0.6)
-            d.press("back")
-            time.sleep(0.8)
-            d.press("back")
-            time.sleep(1.0)
+            print("[recover] 命中 Rewardvideo 页面，尝试受控退出")
+            if try_exit_rewardvideo_page(d, items=items, source="recover"):
+                rewardvideo_streak = 0
+                continue
             if rewardvideo_streak >= 5:
                 print("[recover] Rewardvideo 连续卡住，强制重启起点")
                 start_app(d, QD_APP, init=True)
@@ -710,6 +982,9 @@ def execute_after_click_task(d, timeout=210):
     external_return_attempts = 0
     gate_post_stall_hits = 0
     rewardvideo_gate_hits = 0
+    pre_gate_stall_hits = 0
+    pre_gate_close_fail_hits = 0
+    jump_confirmed = False
 
     while time.time() - start < timeout:
         pkg, activity = get_current_app(d)
@@ -724,14 +999,29 @@ def execute_after_click_task(d, timeout=210):
             last_sig = sig
 
         if close_reward_popup_if_any(d, items):
-            pass
+            items = page_items(d, prefer_hierarchy=True)
+            pkg, activity = get_current_app(d)
+            activity = activity or ""
+            full_text = " ".join(i["text"] for i in items)
+            sig = page_state_signature(pkg, activity, items)
+            last_sig = sig
+            sig_stable_hits = 1
+
+        perm_items = page_items(d, prefer_hierarchy=True)
+        if close_system_permission_dialog_if_any(d, perm_items):
+            last_sig = None
+            sig_stable_hits = 0
+            continue
 
         if is_in_welfare_page(items, activity):
-            if not any(k in full_text for k in ["恭喜", "奖励", "知道了"]):
+            if not is_reward_popup_text(full_text):
                 print("已回到福利任务页")
                 return True
 
         if pkg != QD_APP:
+            jump_confirmed = True
+            pre_gate_stall_hits = 0
+            pre_gate_close_fail_hits = 0
             if not external_watch_started:
                 print(f"检测到外部页面: {pkg}/{activity}，开始浏览后返回")
                 external_watch_started = True
@@ -750,6 +1040,9 @@ def execute_after_click_task(d, timeout=210):
 
         # 起点内广告落地页（非 Rewardvideo 容器）需要先浏览一段时间再返回
         if "ADActivity" in activity and "RewardvideoPortraitADActivity" not in activity:
+            jump_confirmed = True
+            pre_gate_stall_hits = 0
+            pre_gate_close_fail_hits = 0
             if internal_landing_since is None:
                 internal_landing_since = time.time()
                 print(f"检测到起点内广告落地页: {activity}，先浏览再返回")
@@ -770,20 +1063,67 @@ def execute_after_click_task(d, timeout=210):
         # 这时不能过早 back，优先点底部固定 CTA 触发正式计时。
         if "RewardvideoPortraitADActivity" in activity:
             sec0 = detect_countdown_seconds(full_text)
+            if jump_confirmed or landing_rounds >= 1:
+                if sec0 is not None and sec0 > 0:
+                    sleep_sec = min(max(sec0 // 2 + 1, 2), 8)
+                    print(f"[rewardvideo-post] 已触发跳转，按倒计时等待 {sec0}s -> sleep {sleep_sec}s")
+                    time.sleep(sleep_sec)
+                    continue
+                if sig_stable_hits >= 3:
+                    print("[rewardvideo-post] 已触发跳转，后续内容不再解析，直接收尾返回")
+                    return recover_to_welfare_page(d, max_rounds=8)
+                time.sleep(1.2)
+                continue
+            if is_rewardvideo_stuck_reward_page(full_text):
+                print("[rewardvideo] 命中奖励卡死页，直接重启起点恢复")
+                start_app(d, QD_APP, init=True)
+                time.sleep(2.5)
+                return recover_to_welfare_page(d, max_rounds=6)
+            if click_rewardvideo_continue_browse(d, items=items, source="rewardvideo-gate"):
+                rewardvideo_gate_hits = 0
+                pre_gate_stall_hits = 0
+                pre_gate_close_fail_hits = 0
+                continue
+            if is_rewardvideo_recommend_popup(full_text):
+                pre_gate_stall_hits = pre_gate_stall_hits + 1 if sig_stable_hits >= 2 else pre_gate_stall_hits
+                if try_close_rewardvideo_recommend_popup(d, items=items, source="rewardvideo-gate"):
+                    items = ocr_items(d)
+                    full_text = compact_page_text(items)
+                    if click_rewardvideo_continue_browse(d, items=items, source="rewardvideo-gate"):
+                        rewardvideo_gate_hits = 0
+                        pre_gate_stall_hits = 0
+                        pre_gate_close_fail_hits = 0
+                        continue
+                    rewardvideo_gate_hits = 0
+                    pre_gate_stall_hits = 0
+                    pre_gate_close_fail_hits = 0
+                    time.sleep(1.2)
+                    continue
+                pre_gate_close_fail_hits += 1
+                if pre_gate_close_fail_hits >= 3 or pre_gate_stall_hits >= 5:
+                    print("[rewardvideo-gate] 前置领奖卡连续无进展，执行收尾恢复")
+                    return recover_to_welfare_page(d, max_rounds=8)
             if sec0 is None and landing_rounds == 0:
                 rewardvideo_gate_hits += 1
                 print(f"[rewardvideo-gate] 未检测到倒计时，优先点击前置 CTA，第 {rewardvideo_gate_hits} 次")
                 if click_rewardvideo_gate_cta(d):
+                    pre_gate_stall_hits = 0
+                    pre_gate_close_fail_hits = 0
                     time.sleep(2.0)
                     continue
-                if rewardvideo_gate_hits <= 5:
+                if rewardvideo_gate_hits <= 3:
                     time.sleep(1.5)
                     continue
+                print("[rewardvideo-gate] 前置页连续点击 CTA 未推进，执行收尾恢复")
+                return recover_to_welfare_page(d, max_rounds=8)
             else:
                 rewardvideo_gate_hits = 0
+                pre_gate_stall_hits = 0
+                pre_gate_close_fail_hits = 0
 
         if is_pre_countdown_gate(full_text):
             if landing_rounds >= 1:
+                jump_confirmed = True
                 # 已完成至少一次落地页浏览后，不再重复强制跳转，优先等计时/领奖励
                 sec2 = detect_countdown_seconds(full_text)
                 if sec2 is not None and sec2 > 0:
@@ -798,9 +1138,10 @@ def execute_after_click_task(d, timeout=210):
                     gate_post_stall_hits = 0
                     continue
                 if sig_stable_hits >= 4:
-                    print("[gate-post] 页面无进展，执行受控 back")
-                    d.press("back")
-                    time.sleep(1.0)
+                    print("[gate-post] 页面无进展，尝试受控退出 Rewardvideo")
+                    if try_exit_rewardvideo_page(d, items=items, source="gate-post"):
+                        gate_post_stall_hits = 0
+                        continue
                     gate_post_stall_hits += 1
                     if gate_post_stall_hits >= 6:
                         print("[gate-post] 连续无进展，触发收尾回退")
@@ -808,6 +1149,7 @@ def execute_after_click_task(d, timeout=210):
                 continue
             advanced = advance_pre_countdown_gate(d, items)
             if advanced:
+                pre_gate_stall_hits = 0
                 if sig_stable_hits >= 4:
                     print("[gate] 连续点击后页面仍未变化，改用 back+滑动切换层级")
                     d.press("back")
@@ -817,14 +1159,33 @@ def execute_after_click_task(d, timeout=210):
                 time.sleep(1.0)
                 continue
             if sig_stable_hits >= 3:
-                print("[gate] 页面长时间无变化，执行底部中点兜底点击")
-                w, h = d.window_size()
-                d.click(int(w * 0.5), int(h * 0.86))
-                time.sleep(1.2)
+                if "RewardvideoPortraitADActivity" in activity:
+                    if try_close_rewardvideo_recommend_popup(d, items=items, source="gate-stall"):
+                        pre_gate_stall_hits = 0
+                        time.sleep(1.0)
+                        continue
+                    pre_gate_stall_hits += 1
+                    if pre_gate_stall_hits >= 4:
+                        print("[gate] Rewardvideo 前置页长时间无变化，直接收尾恢复")
+                        return recover_to_welfare_page(d, max_rounds=8)
+                    print("[gate] Rewardvideo 前置页长时间无变化，跳过底部兜底点击，避免误跳外部应用")
+                    time.sleep(1.2)
+                else:
+                    print("[gate] 页面长时间无变化，执行底部中点兜底点击")
+                    w, h = d.window_size()
+                    d.click(int(w * 0.5), int(h * 0.86))
+                    time.sleep(1.2)
             continue
 
-        if any(k in full_text for k in ["了解详情", "了解更多", "继续看", "继续观看", "去看看"]):
+        cta_prompt_words = ["了解详情", "了解更多", "继续看", "继续观看", "去看看"]
+        is_ad_context = (
+            "RewardvideoPortraitADActivity" in activity
+            or "ADActivity" in activity
+            or any(k in full_text for k in AD_LAYER_HINT_WORDS)
+        )
+        if is_ad_context and any(k in full_text for k in cta_prompt_words):
             if landing_rounds >= 1:
+                jump_confirmed = True
                 sec3 = detect_countdown_seconds(full_text)
                 if sec3 is not None and sec3 > 0:
                     wait3 = min(max(sec3 // 2 + 1, 2), 8)
@@ -833,7 +1194,7 @@ def execute_after_click_task(d, timeout=210):
                 else:
                     time.sleep(1.2)
                 continue
-            if click_text_candidate(d, items, ["继续观看", "继续看", "了解详情", "了解更多", "去看看"], region="all"):
+            if click_text_candidate(d, items, cta_prompt_words, region="all"):
                 print("已点击广告CTA，等待跳转/计时")
                 time.sleep(2)
                 continue
@@ -1035,6 +1396,15 @@ def run_qidian_fuli_tasks(d):
                     handled = True
                     task_status = "already_done"
                     task_note = f"按钮状态: {action['raw_text']}"
+                    stats["already_done"] += 1
+                    round_finished = True
+                    break
+
+                if action_text.startswith("剩"):
+                    print("该任务处于冷却倒计时，暂不可执行，跳过")
+                    handled = True
+                    task_status = "already_done"
+                    task_note = f"冷却中: {action['raw_text']}"
                     stats["already_done"] += 1
                     round_finished = True
                     break
